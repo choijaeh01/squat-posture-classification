@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
@@ -90,10 +91,10 @@ class SquatWindowDataset(Dataset):
     """
     PyTorch dataset for windowed CSV files exported from IMU recordings.
 
-    Assumes each CSV lives under `data/manually_labeled/class{idx}/...`.
-    Files are loaded via `numpy.loadtxt`, so plain numeric CSV content is
-    expected. The dataset returns `(window, label)` tuples where `window`
-    is a `torch.Tensor` shaped `(num_channels, num_timesteps)`.
+    Each sample lives under `data/manually_labeled/class{idx}/...`. CSV files
+    are read with pandas so header 행이나 문자열 컬럼(예: timestamp)이 있어도 처리할 수
+    있으며, 필요하면 `drop_columns`로 명시적으로 제외할 수 있습니다. 반환되는
+    텐서는 `(channels, timesteps)` 형태입니다.
     """
 
     def __init__(
@@ -101,10 +102,14 @@ class SquatWindowDataset(Dataset):
         root: Path,
         transforms: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         file_extension: str = ".csv",
+        drop_columns: Optional[Sequence[str]] = None,
+        target_length: Optional[int] = None,
     ) -> None:
         self.root = Path(root)
         self.transforms = transforms
         self.file_extension = file_extension
+        self.drop_columns = tuple(drop_columns) if drop_columns is not None else None
+        self.target_length = target_length
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset directory does not exist: {self.root}")
@@ -129,14 +134,32 @@ class SquatWindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         csv_path, label = self._samples[index]
-        data = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
-        # Convert to (channels, time) layout expected by 1D CNNs.
-        tensor = torch.from_numpy(data).T.contiguous()
+        tensor = self._load_csv(csv_path)
 
         if self.transforms is not None:
             tensor = self.transforms(tensor)
 
         return tensor, label.value
+
+    def _load_csv(self, path: Path) -> torch.Tensor:
+        """Read a CSV, drop non-numeric columns, and return (channels, time) tensor."""
+
+        df = pd.read_csv(path)
+        if self.drop_columns is not None:
+            existing = [col for col in self.drop_columns if col in df.columns]
+            df = df.drop(columns=existing)
+
+        # 기본적으로 문자열(예: timestamp)을 제외하고 숫자 컬럼만 사용.
+        numeric_df = df.select_dtypes(include=[np.number])
+        if numeric_df.empty:
+            raise ValueError(f"No numeric columns found in {path}")
+
+        data = numeric_df.to_numpy(dtype=np.float32)
+
+        if self.target_length is not None and data.shape[0] != self.target_length:
+            data = _resample_to_length(data, self.target_length)
+
+        return torch.from_numpy(data.T.copy())
 
 
 def make_dataloader(
@@ -198,3 +221,30 @@ def iter_class_counts(dataset: Dataset) -> Iterable[Tuple[SquatClass, int]]:
     for _, label in dataset:
         counts[SquatClass(label)] += 1
     return counts.items()
+
+
+def _resample_to_length(data: np.ndarray, target_length: int) -> np.ndarray:
+    """
+    Interpolate a (time, features) array to the desired length.
+
+    Args:
+        data: Array shaped `(num_steps, num_features)`.
+        target_length: Desired number of timesteps.
+    """
+
+    if target_length <= 0:
+        raise ValueError("`target_length` must be greater than zero.")
+
+    num_steps = data.shape[0]
+    if num_steps == target_length:
+        return data
+
+    base_positions = np.linspace(0, num_steps - 1, num_steps, dtype=np.float32)
+    target_positions = np.linspace(0, num_steps - 1, target_length, dtype=np.float32)
+
+    resampled = np.empty((target_length, data.shape[1]), dtype=np.float32)
+    for feature_idx in range(data.shape[1]):
+        resampled[:, feature_idx] = np.interp(
+            target_positions, base_positions, data[:, feature_idx]
+        )
+    return resampled

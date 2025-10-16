@@ -74,7 +74,7 @@ results/
 outputs/
 
 # Model checkpoints
-models/
+/models/
 !models/.gitkeep
 
 # Temporary files

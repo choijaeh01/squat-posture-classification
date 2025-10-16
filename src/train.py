@@ -49,7 +49,12 @@ def build_datasets(
         )
 
     labeled_root = DatasetLayout(data_root).manually_labeled
-    dataset = SquatWindowDataset(labeled_root, transforms=transforms)
+    dataset = SquatWindowDataset(
+        labeled_root,
+        transforms=transforms,
+        drop_columns=("timestamp",),
+        target_length=400,
+    )
     return train_val_test_split(dataset)
 
 
